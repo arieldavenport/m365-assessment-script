@@ -2,7 +2,27 @@
 
 One-shot Microsoft 365 tenant assessment. Paste it into the M365 admin
 center Cloud Shell (or any PowerShell 7+ host with `Microsoft.Graph`
-installed) and walk away with three CSVs:
+installed) and walk away with three CSVs.
+
+## Quick start (one line)
+
+Open the **Cloud Shell** in the Microsoft 365 admin center (PowerShell mode),
+paste this, hit enter:
+
+```powershell
+irm https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/main/Invoke-M365Assessment.ps1 | iex
+```
+
+Consent to the Graph scopes when prompted. Three CSVs land in the current
+directory; download them from the Cloud Shell file browser.
+
+To pass parameters (e.g. a different stale-user cutoff), wrap it:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/main/Invoke-M365Assessment.ps1))) -StaleDays 60
+```
+
+## What you get
 
 | File | What's in it |
 | --- | --- |
@@ -10,10 +30,9 @@ installed) and walk away with three CSVs:
 | `M365_Products_<tenant>_<ts>.csv`     | Subscribed SKUs across all billing accounts the tenant can see (total / consumed / available licenses, service plans, friendly product names). |
 | `M365_StaleUsers_<tenant>_<ts>.csv`   | Enabled, non-guest accounts whose most recent sign-in is older than `-StaleDays` (default 90), or that have never signed in and were created longer ago than the threshold. |
 
-## Usage
+## Alternate usage
 
-In the M365 admin center, open **Cloud Shell** (PowerShell), upload or
-paste the script, then run:
+If you'd rather upload the file into Cloud Shell and run it locally:
 
 ```powershell
 ./Invoke-M365Assessment.ps1
