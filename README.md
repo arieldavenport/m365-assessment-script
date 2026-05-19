@@ -1,1 +1,1 @@
-# -arieldavenport-m365-assessment-script
+#m365-assessment-script
