@@ -304,3 +304,22 @@ Write-Host 'Files:' -ForegroundColor Green
 Write-Host "  $usersCsv"
 Write-Host "  $productsCsv"
 Write-Host "  $staleCsv"
+
+# ---------------------------------------------------------------------------
+# 8. Bundle all CSVs into a single zip for one-click download
+# ---------------------------------------------------------------------------
+$zipPath = Join-Path $OutputPath "M365_Assessment_${tenantTag}_${timestamp}.zip"
+try {
+    Compress-Archive -Path $usersCsv, $productsCsv, $staleCsv -DestinationPath $zipPath -Force
+    Write-Host ''
+    Write-Host 'One-file bundle (paste this into the Cloud Shell download dialog):' -ForegroundColor Green
+    Write-Host "  $zipPath" -ForegroundColor Cyan
+    # Cloud Shell PowerShell exposes a Download-File cmdlet that opens the browser
+    # download dialog with the path pre-filled. Try it if present.
+    $dl = Get-Command Download-File -ErrorAction SilentlyContinue
+    if ($dl) {
+        try { Download-File -Path $zipPath } catch { }
+    }
+} catch {
+    Write-Warning "Could not create zip bundle: $($_.Exception.Message). Individual CSVs are still listed above."
+}
