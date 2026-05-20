@@ -72,8 +72,35 @@ $scopes = @(
     'Directory.Read.All',
     'AuditLog.Read.All'
 )
-Write-Host "Connecting to Microsoft Graph: $($scopes -join ', ')" -ForegroundColor Cyan
-Connect-MgGraph -Scopes $scopes -NoWelcome
+
+function Connect-ViaAzToken {
+    # Reuse the existing Az session (Cloud Shell signs you in silently). This
+    # avoids the device-code prompt entirely, which Conditional Access policies
+    # frequently block. The Az PowerShell app holds Directory.AccessAsUser.All,
+    # which is enough for users + SKUs. signInActivity may still 403 if the
+    # tenant lacks AuditLog.Read.All consent on that app -- the script handles
+    # that case by falling back.
+    if (-not (Get-Command Get-AzAccessToken -ErrorAction SilentlyContinue)) { return $false }
+    try {
+        $tok = Get-AzAccessToken -ResourceUrl 'https://graph.microsoft.com' -ErrorAction Stop
+        $secure = if ($tok.Token -is [System.Security.SecureString]) {
+            $tok.Token
+        } else {
+            ConvertTo-SecureString -String $tok.Token -AsPlainText -Force
+        }
+        Connect-MgGraph -AccessToken $secure -NoWelcome
+        return $true
+    } catch {
+        Write-Warning "Could not reuse Az token ($($_.Exception.Message)). Falling back to interactive sign-in."
+        return $false
+    }
+}
+
+Write-Host 'Connecting to Microsoft Graph (reusing Cloud Shell Az session) ...' -ForegroundColor Cyan
+if (-not (Connect-ViaAzToken)) {
+    Write-Host "Interactive sign-in: $($scopes -join ', ')" -ForegroundColor Yellow
+    Connect-MgGraph -Scopes $scopes -NoWelcome
+}
 
 $context  = Get-MgContext
 $orgResp  = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/organization' -OutputType PSObject
