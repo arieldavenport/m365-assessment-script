@@ -1,67 +1,58 @@
 # m365-assessment-script
 
-One-shot Microsoft 365 tenant assessment. Paste it into the M365 admin
-center Cloud Shell (or any PowerShell 7+ host with `Microsoft.Graph`
-installed) and walk away with three CSVs.
+One-shot Microsoft 365 tenant assessment. Paste a single line into the
+Microsoft 365 admin center **Cloud Shell (Bash)** and walk away with a
+zip containing three CSVs.
 
 ## Quick start (one line)
 
-Open the **Cloud Shell** in the Microsoft 365 admin center (PowerShell mode),
-paste this, hit enter:
+Open Cloud Shell in **Bash** mode (top-left "Switch to Bash" button if it's in
+PowerShell), then paste:
 
-```powershell
-irm https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/main/Invoke-M365Assessment.ps1 | iex
+```bash
+curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/main/m365-assessment.sh | bash
 ```
 
-Consent to the Graph scopes when prompted. Three CSVs land in the current
-directory; download them from the Cloud Shell file browser.
+Cloud Shell pops the file-download dialog at the end with the zip
+pre-selected. No second sign-in (reuses your existing Azure CLI session),
+no module installs, no Conditional Access friction.
 
-To pass parameters (e.g. a different stale-user cutoff), wrap it:
+Need different options? Pass arguments through:
 
-```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/main/Invoke-M365Assessment.ps1))) -StaleDays 60
+```bash
+curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/main/m365-assessment.sh | bash -s -- --stale-days 60
 ```
 
 ## What you get
 
-| File | What's in it |
+| File in zip | What's in it |
 | --- | --- |
 | `M365_Users_<tenant>_<ts>.csv`        | Mirrors the admin center "Active users" export plus sign-in activity (last interactive / non-interactive / successful sign-in, days since last activity). |
 | `M365_Products_<tenant>_<ts>.csv`     | Subscribed SKUs across all billing accounts the tenant can see (total / consumed / available licenses, service plans, friendly product names). |
-| `M365_StaleUsers_<tenant>_<ts>.csv`   | Enabled, non-guest accounts whose most recent sign-in is older than `-StaleDays` (default 90), or that have never signed in and were created longer ago than the threshold. |
+| `M365_StaleUsers_<tenant>_<ts>.csv`   | Enabled, non-guest accounts whose most recent sign-in is older than `--stale-days` (default 90), or that have never signed in and were created longer ago than the threshold. |
 
-## Alternate usage
+## Options
 
-If you'd rather upload the file into Cloud Shell and run it locally:
-
-```powershell
-./Invoke-M365Assessment.ps1
-```
-
-A browser / device-code prompt asks you to consent to these Graph scopes
-the first time:
-
-- `User.Read.All`
-- `Organization.Read.All`
-- `Directory.Read.All`
-- `AuditLog.Read.All`
-
-CSVs land in the current directory; download them from the Cloud Shell
-file browser.
-
-### Parameters
-
-| Parameter | Default | Notes |
+| Flag | Default | Notes |
 | --- | --- | --- |
-| `-OutputPath`         | current dir | Where the CSVs are written. |
-| `-StaleDays`          | `90`        | Inactivity threshold for the stale-users CSV. |
-| `-SkipFriendlyNames`  | off         | Skip the one-time download of Microsoft's SKU friendly-name map; CSV keeps raw `SkuPartNumber` values. |
+| `--stale-days N`         | `90`        | Inactivity threshold for the stale-users CSV. |
+| `--output-dir PATH`      | `$HOME`     | Where the CSVs / zip are written. |
+| `--skip-friendly-names`  | off         | Skip downloading Microsoft's SKU friendly-name map; CSV keeps raw `SkuPartNumber` values. |
+| `--no-download`          | off         | Don't auto-trigger the Cloud Shell download dialog; just print the zip path. |
 
 ## Requirements
 
-- PowerShell 7+ (Cloud Shell already has it).
-- `Microsoft.Graph` modules (auto-installed to the current user if missing).
+- Microsoft 365 admin center / Azure Cloud Shell **Bash** mode (already has `az`, `curl`, `jq`, `zip`, `python3`).
 - An account with at least **Global Reader** on the tenant.
-- **Microsoft Entra ID P1 or P2** for the `signInActivity` property. Without
-  it the script still produces the user and product CSVs, but the stale-user
-  list falls back to a created-date heuristic and prints a warning.
+- The Azure CLI session in Cloud Shell already covers Graph delegated permissions via `Directory.AccessAsUser.All` — enough for users + products.
+- `signInActivity` on user rows requires `AuditLog.Read.All` consent on the Azure CLI app. If it's not granted, the user export still produces successfully but the sign-in columns are blank and the stale list falls back to a created-date heuristic.
+
+## Running locally
+
+If you'd rather not pipe from `curl`:
+
+```bash
+wget https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/main/m365-assessment.sh
+chmod +x m365-assessment.sh
+./m365-assessment.sh --stale-days 90
+```
