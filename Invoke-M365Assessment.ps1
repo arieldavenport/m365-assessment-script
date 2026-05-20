@@ -3,41 +3,44 @@
     One-shot Microsoft 365 tenant assessment: users, products, and stale accounts.
 
 .DESCRIPTION
-    Designed to be pasted into the Microsoft 365 admin center Cloud Shell (or any
-    PowerShell 7+ host with the Microsoft.Graph module installed). Produces three
-    CSVs in the working directory:
+    Designed to run in the Microsoft 365 admin center / Azure Cloud Shell
+    (PowerShell). Uses only Microsoft.Graph.Authentication (pre-loaded in
+    Cloud Shell) and direct Graph REST calls via Invoke-MgGraphRequest, so
+    no module installs and no assembly version conflicts.
+
+    Produces three CSVs in the working directory:
 
         M365_Users_<tenant>_<timestamp>.csv
-            Mirrors the admin center Active users export, plus sign-in activity
-            (LastSignInDateTime / LastNonInteractiveSignInDateTime /
-            LastSuccessfulSignInDateTime) and DaysSinceLastActivity.
+            Active users export plus signInActivity (LastSignInDateTime /
+            LastNonInteractiveSignInDateTime / LastSuccessfulSignInDateTime)
+            and DaysSinceLastActivity.
 
         M365_Products_<tenant>_<timestamp>.csv
-            Subscribed SKUs (the "Products" / "Licenses" view), with friendly
-            product names resolved via Microsoft's published mapping CSV.
+            Subscribed SKUs (the "Products" / "Licenses" view) with friendly
+            product names resolved from Microsoft's published mapping CSV.
 
         M365_StaleUsers_<tenant>_<timestamp>.csv
-            Enabled member users whose most recent sign-in activity is older
-            than -StaleDays (default 90), or who have never signed in and were
-            created more than -StaleDays ago.
+            Enabled, non-guest accounts inactive >= -StaleDays (default 90),
+            or that have never signed in and were created longer ago than the
+            threshold.
 
 .PARAMETER OutputPath
     Folder where CSVs are written. Defaults to current directory.
 
 .PARAMETER StaleDays
-    Threshold in days for flagging stale accounts. Default 90.
+    Inactivity threshold for the stale-users CSV. Default 90.
 
 .PARAMETER SkipFriendlyNames
-    Skip the one-time download of Microsoft's SKU friendly-name map. The CSV
-    will fall back to raw SkuPartNumber values.
+    Skip the one-time download of Microsoft's SKU friendly-name map.
 
 .NOTES
     Required Graph scopes (consented on first connect):
         User.Read.All, Organization.Read.All, Directory.Read.All, AuditLog.Read.All
 
-    signInActivity requires AuditLog.Read.All AND a Microsoft Entra ID P1 or P2
-    license on the tenant. If the tenant lacks P1/P2 the script gracefully
-    falls back to a user export without sign-in fields.
+    signInActivity requires AuditLog.Read.All AND Entra ID P1/P2. Without
+    P1/P2 the script still produces the user and product CSVs; sign-in
+    columns are blank and the stale list falls back to a created-date
+    heuristic.
 #>
 
 [CmdletBinding()]
@@ -50,23 +53,18 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # ---------------------------------------------------------------------------
-# 1. Module bootstrap
+# 1. Minimal module bootstrap — only Microsoft.Graph.Authentication is needed
 # ---------------------------------------------------------------------------
-$requiredModules = @(
-    'Microsoft.Graph.Authentication',
-    'Microsoft.Graph.Users',
-    'Microsoft.Graph.Identity.DirectoryManagement'
-)
-foreach ($module in $requiredModules) {
-    if (-not (Get-Module -ListAvailable -Name $module)) {
-        Write-Host "Installing module $module ..." -ForegroundColor Yellow
-        Install-Module $module -Scope CurrentUser -Force -AllowClobber
+if (-not (Get-Module -Name Microsoft.Graph.Authentication)) {
+    if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
+        Write-Host 'Installing Microsoft.Graph.Authentication ...' -ForegroundColor Yellow
+        Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force -AllowClobber
     }
-    Import-Module $module -ErrorAction Stop
+    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
 }
 
 # ---------------------------------------------------------------------------
-# 2. Connect to Microsoft Graph
+# 2. Connect
 # ---------------------------------------------------------------------------
 $scopes = @(
     'User.Read.All',
@@ -77,12 +75,13 @@ $scopes = @(
 Write-Host "Connecting to Microsoft Graph: $($scopes -join ', ')" -ForegroundColor Cyan
 Connect-MgGraph -Scopes $scopes -NoWelcome
 
-$context = Get-MgContext
-$org     = Get-MgOrganization | Select-Object -First 1
-$tenantTag = ($org.DisplayName -replace '[^a-zA-Z0-9]', '_')
+$context  = Get-MgContext
+$orgResp  = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/organization' -OutputType PSObject
+$org      = $orgResp.value | Select-Object -First 1
+$tenantTag = ($org.displayName -replace '[^a-zA-Z0-9]', '_')
 $timestamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
 
-Write-Host "Connected to: $($org.DisplayName)  ($($context.TenantId))" -ForegroundColor Green
+Write-Host "Connected to: $($org.displayName)  ($($context.TenantId))" -ForegroundColor Green
 
 if (-not (Test-Path $OutputPath)) {
     New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
@@ -93,13 +92,25 @@ $productsCsv = Join-Path $OutputPath "M365_Products_${tenantTag}_${timestamp}.cs
 $staleCsv    = Join-Path $OutputPath "M365_StaleUsers_${tenantTag}_${timestamp}.csv"
 
 # ---------------------------------------------------------------------------
-# 3. SKU friendly-name map (GUID -> Product display name)
+# 3. Helpers
 # ---------------------------------------------------------------------------
+function Get-GraphAllPages {
+    param([string]$Uri)
+    $all = New-Object System.Collections.Generic.List[object]
+    $next = $Uri
+    while ($next) {
+        $page = Invoke-MgGraphRequest -Method GET -Uri $next -OutputType PSObject
+        if ($page.value) { foreach ($v in $page.value) { [void]$all.Add($v) } }
+        $next = $page.'@odata.nextLink'
+    }
+    return $all
+}
+
 $skuMap = @{}
 if (-not $SkipFriendlyNames) {
     $skuCsvUrl = 'https://download.microsoft.com/download/e/3/e/e3e9faf2-f28b-490a-9ada-c6089a1fc5b0/Product%20names%20and%20service%20plan%20identifiers%20for%20licensing.csv'
     try {
-        Write-Host "Downloading SKU friendly-name map ..." -ForegroundColor Cyan
+        Write-Host 'Downloading SKU friendly-name map ...' -ForegroundColor Cyan
         $tmp = [System.IO.Path]::GetTempFileName()
         Invoke-WebRequest -Uri $skuCsvUrl -OutFile $tmp -UseBasicParsing
         foreach ($row in (Import-Csv -Path $tmp)) {
@@ -124,26 +135,26 @@ function Resolve-SkuName {
 # ---------------------------------------------------------------------------
 # 4. Products / subscribed SKUs
 # ---------------------------------------------------------------------------
-Write-Host "Collecting subscribed SKUs (products) ..." -ForegroundColor Cyan
-$skus = Get-MgSubscribedSku -All
+Write-Host 'Collecting subscribed SKUs (products) ...' -ForegroundColor Cyan
+$skus = Get-GraphAllPages 'https://graph.microsoft.com/v1.0/subscribedSkus'
 
 $productRows = foreach ($s in $skus) {
-    $enabled   = [int]$s.PrepaidUnits.Enabled
-    $consumed  = [int]$s.ConsumedUnits
+    $enabled  = [int]$s.prepaidUnits.enabled
+    $consumed = [int]$s.consumedUnits
     [pscustomobject]@{
-        ProductName       = Resolve-SkuName -SkuId $s.SkuId -SkuPartNumber $s.SkuPartNumber
-        SkuPartNumber     = $s.SkuPartNumber
-        SkuId             = $s.SkuId
-        AppliesTo         = $s.AppliesTo
-        CapabilityStatus  = $s.CapabilityStatus
+        ProductName       = Resolve-SkuName -SkuId $s.skuId -SkuPartNumber $s.skuPartNumber
+        SkuPartNumber     = $s.skuPartNumber
+        SkuId             = $s.skuId
+        AppliesTo         = $s.appliesTo
+        CapabilityStatus  = $s.capabilityStatus
         TotalLicenses     = $enabled
         ConsumedLicenses  = $consumed
         AvailableLicenses = $enabled - $consumed
-        SuspendedLicenses = [int]$s.PrepaidUnits.Suspended
-        WarningLicenses   = [int]$s.PrepaidUnits.Warning
-        AccountId         = $s.AccountId
-        AccountName       = $s.AccountName
-        ServicePlans      = (($s.ServicePlans | ForEach-Object { $_.ServicePlanName }) -join ';')
+        SuspendedLicenses = [int]$s.prepaidUnits.suspended
+        WarningLicenses   = [int]$s.prepaidUnits.warning
+        AccountId         = $s.accountId
+        AccountName       = $s.accountName
+        ServicePlans      = (($s.servicePlans | ForEach-Object { $_.servicePlanName }) -join ';')
     }
 }
 $productRows | Sort-Object ProductName | Export-Csv -Path $productsCsv -NoTypeInformation -Encoding UTF8
@@ -152,34 +163,34 @@ Write-Host "Wrote $($productRows.Count) product rows -> $productsCsv" -Foregroun
 # ---------------------------------------------------------------------------
 # 5. Users + sign-in activity
 # ---------------------------------------------------------------------------
-Write-Host "Collecting users (may take a minute on large tenants) ..." -ForegroundColor Cyan
+Write-Host 'Collecting users (may take a minute on large tenants) ...' -ForegroundColor Cyan
 
-$userProperties = @(
-    'id','userPrincipalName','displayName','givenName','surname','mail',
-    'userType','accountEnabled','createdDateTime','department','jobTitle',
-    'officeLocation','mobilePhone','businessPhones','city','state','country',
-    'usageLocation','proxyAddresses','assignedLicenses','signInActivity'
-)
+$baseProps  = 'id,userPrincipalName,displayName,givenName,surname,mail,userType,accountEnabled,createdDateTime,department,jobTitle,officeLocation,mobilePhone,businessPhones,city,state,country,usageLocation,proxyAddresses,assignedLicenses'
+$withSignIn = "$baseProps,signInActivity"
 
 $signInAvailable = $true
 try {
-    $users = Get-MgUser -All -Property $userProperties -ErrorAction Stop
+    $users = Get-GraphAllPages "https://graph.microsoft.com/v1.0/users?`$select=$withSignIn&`$top=999"
 } catch {
-    Write-Warning "Could not retrieve signInActivity ($($_.Exception.Message)). Retrying without it; stale detection will be limited."
+    Write-Warning "Could not retrieve signInActivity ($($_.Exception.Message)). Retrying without it; stale detection will fall back to created-date."
     $signInAvailable = $false
-    $userProperties  = $userProperties | Where-Object { $_ -ne 'signInActivity' }
-    $users = Get-MgUser -All -Property $userProperties
+    $users = Get-GraphAllPages "https://graph.microsoft.com/v1.0/users?`$select=$baseProps&`$top=999"
 }
 
 $now = Get-Date
 $userRows = foreach ($u in $users) {
-    $licenseNames = foreach ($lic in $u.AssignedLicenses) {
-        Resolve-SkuName -SkuId $lic.SkuId -SkuPartNumber $null
+    $licenseNames = foreach ($lic in $u.assignedLicenses) {
+        Resolve-SkuName -SkuId $lic.skuId -SkuPartNumber $null
     }
 
-    $lastSignIn   = $u.SignInActivity.LastSignInDateTime
-    $lastNonInter = $u.SignInActivity.LastNonInteractiveSignInDateTime
-    $lastSuccess  = $u.SignInActivity.LastSuccessfulSignInDateTime
+    $lastSignIn   = $null
+    $lastNonInter = $null
+    $lastSuccess  = $null
+    if ($u.signInActivity) {
+        $lastSignIn   = $u.signInActivity.lastSignInDateTime
+        $lastNonInter = $u.signInActivity.lastNonInteractiveSignInDateTime
+        $lastSuccess  = $u.signInActivity.lastSuccessfulSignInDateTime
+    }
 
     $mostRecent = @($lastSignIn, $lastNonInter, $lastSuccess) |
         Where-Object { $_ } |
@@ -187,34 +198,37 @@ $userRows = foreach ($u in $users) {
         Select-Object -First 1
 
     $daysSince = $null
-    if ($mostRecent) { $daysSince = [int]($now - $mostRecent).TotalDays }
+    if ($mostRecent) {
+        $dt = if ($mostRecent -is [datetime]) { $mostRecent } else { [datetime]$mostRecent }
+        $daysSince = [int]($now - $dt).TotalDays
+    }
 
     [pscustomobject]@{
-        UserPrincipalName                = $u.UserPrincipalName
-        DisplayName                      = $u.DisplayName
-        FirstName                        = $u.GivenName
-        LastName                         = $u.Surname
-        Mail                             = $u.Mail
-        UserType                         = $u.UserType
-        AccountEnabled                   = $u.AccountEnabled
-        CreatedDateTime                  = $u.CreatedDateTime
-        Department                       = $u.Department
-        JobTitle                         = $u.JobTitle
-        OfficeLocation                   = $u.OfficeLocation
-        MobilePhone                      = $u.MobilePhone
-        BusinessPhones                   = ($u.BusinessPhones -join ';')
-        City                             = $u.City
-        State                            = $u.State
-        Country                          = $u.Country
-        UsageLocation                    = $u.UsageLocation
-        ProxyAddresses                   = ($u.ProxyAddresses -join ';')
+        UserPrincipalName                = $u.userPrincipalName
+        DisplayName                      = $u.displayName
+        FirstName                        = $u.givenName
+        LastName                         = $u.surname
+        Mail                             = $u.mail
+        UserType                         = $u.userType
+        AccountEnabled                   = $u.accountEnabled
+        CreatedDateTime                  = $u.createdDateTime
+        Department                       = $u.department
+        JobTitle                         = $u.jobTitle
+        OfficeLocation                   = $u.officeLocation
+        MobilePhone                      = $u.mobilePhone
+        BusinessPhones                   = ($u.businessPhones -join ';')
+        City                             = $u.city
+        State                            = $u.state
+        Country                          = $u.country
+        UsageLocation                    = $u.usageLocation
+        ProxyAddresses                   = ($u.proxyAddresses -join ';')
         AssignedLicenses                 = ($licenseNames -join ';')
-        LicenseCount                     = @($u.AssignedLicenses).Count
+        LicenseCount                     = @($u.assignedLicenses).Count
         LastSignInDateTime               = $lastSignIn
         LastNonInteractiveSignInDateTime = $lastNonInter
         LastSuccessfulSignInDateTime     = $lastSuccess
         DaysSinceLastActivity            = $daysSince
-        UserId                           = $u.Id
+        UserId                           = $u.id
     }
 }
 $userRows | Export-Csv -Path $usersCsv -NoTypeInformation -Encoding UTF8
@@ -247,16 +261,16 @@ Write-Host ''
 Write-Host '=========================================' -ForegroundColor Cyan
 Write-Host '  M365 Tenant Assessment Complete'        -ForegroundColor Cyan
 Write-Host '=========================================' -ForegroundColor Cyan
-Write-Host ("Tenant:               {0}"     -f $org.DisplayName)
-Write-Host ("Tenant ID:            {0}"     -f $context.TenantId)
-Write-Host ("Total users:          {0}"     -f $userRows.Count)
-Write-Host ("  Enabled:            {0}"     -f $enabledCount)
-Write-Host ("  Guests:             {0}"     -f $guestCount)
-Write-Host ("Products / SKUs:      {0}"     -f $productRows.Count)
+Write-Host ("Tenant:                    {0}" -f $org.displayName)
+Write-Host ("Tenant ID:                 {0}" -f $context.TenantId)
+Write-Host ("Total users:               {0}" -f $userRows.Count)
+Write-Host ("  Enabled:                 {0}" -f $enabledCount)
+Write-Host ("  Guests:                  {0}" -f $guestCount)
+Write-Host ("Products / SKUs:           {0}" -f $productRows.Count)
 Write-Host ("Licenses (consumed/total): {0} / {1}" -f $consumedLic, $totalLic)
-Write-Host ("Stale users (>${StaleDays}d):    {0}" -f $staleRows.Count)
+Write-Host ("Stale users (>${StaleDays}d):         {0}" -f $staleRows.Count)
 if (-not $signInAvailable) {
-    Write-Host 'NOTE: signInActivity was unavailable. Stale users fall back to created-date heuristic only.' -ForegroundColor Yellow
+    Write-Host 'NOTE: signInActivity was unavailable. Stale users use created-date heuristic only.' -ForegroundColor Yellow
 }
 Write-Host ''
 Write-Host 'Files:' -ForegroundColor Green
