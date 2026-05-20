@@ -312,14 +312,15 @@ $zipPath = Join-Path $OutputPath "M365_Assessment_${tenantTag}_${timestamp}.zip"
 try {
     Compress-Archive -Path $usersCsv, $productsCsv, $staleCsv -DestinationPath $zipPath -Force
     Write-Host ''
-    Write-Host 'One-file bundle (paste this into the Cloud Shell download dialog):' -ForegroundColor Green
-    Write-Host "  $zipPath" -ForegroundColor Cyan
-    # Cloud Shell PowerShell exposes a Download-File cmdlet that opens the browser
-    # download dialog with the path pre-filled. Try it if present.
-    $dl = Get-Command Download-File -ErrorAction SilentlyContinue
-    if ($dl) {
-        try { Download-File -Path $zipPath } catch { }
-    }
+    Write-Host '------------------------------------------------------------' -ForegroundColor Green
+    Write-Host ' DOWNLOAD: copy the path below and paste it into             ' -ForegroundColor Green
+    Write-Host ' Manage files -> Download (top toolbar in Cloud Shell)       ' -ForegroundColor Green
+    Write-Host '------------------------------------------------------------' -ForegroundColor Green
+    Write-Host ''
+    # Print the path bare on its own line so triple-click selects exactly the path.
+    Write-Host $zipPath
+    Write-Host ''
+    Write-Host "Shortcut: switch to Bash (top-left button), then run:  download '$zipPath'" -ForegroundColor DarkGray
 } catch {
     Write-Warning "Could not create zip bundle: $($_.Exception.Message). Individual CSVs are still listed above."
 }
