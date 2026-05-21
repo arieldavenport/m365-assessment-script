@@ -120,31 +120,90 @@ get_all_pages() {
 }
 
 # ---------------------------------------------------------------------------
-# Products / subscribed SKUs
+# Products / subscribed SKUs + commerce subscriptions (for renewal dates)
 # ---------------------------------------------------------------------------
-echo "Collecting subscribed SKUs (products)..."
+echo "Collecting subscribed SKUs..."
 SKUS=$(get_all_pages 'https://graph.microsoft.com/v1.0/subscribedSkus')
 
-jq -r --argjson map "$SKU_MAP_JSON" '
-    ["ProductName","SkuPartNumber","SkuId","AppliesTo","CapabilityStatus","TotalLicenses","ConsumedLicenses","AvailableLicenses","SuspendedLicenses","WarningLicenses","AccountId","AccountName","ServicePlans"],
-    (sort_by($map[.skuId] // .skuPartNumber)[] | [
+echo "Collecting subscription renewal info (companySubscription)..."
+SUBS_LIST='[]'
+SUBS_AVAILABLE=0
+# Try v1.0 first, fall back to beta. Either may return 403 on tenants where the
+# Azure CLI app doesn't have Directory.Read.All consent for subscriptions; in
+# that case renewal columns will simply be blank.
+for SUBS_URL in 'https://graph.microsoft.com/v1.0/directory/subscriptions' \
+                'https://graph.microsoft.com/beta/directory/subscriptions'; do
+    if SUBS_TRY=$(get_all_pages "$SUBS_URL" 2>/dev/null); then
+        SUBS_LIST="$SUBS_TRY"
+        SUBS_AVAILABLE=1
+        echo "Loaded $(jq 'length' <<<"$SUBS_LIST") subscriptions from ${SUBS_URL##*/com}."
+        break
+    fi
+done
+if [[ $SUBS_AVAILABLE -ne 1 ]]; then
+    echo "WARNING: could not read directory/subscriptions; renewal date column will be blank." >&2
+fi
+
+# Build combined input and emit one row per subscription, with SKU-level
+# consumption joined in. SKUs that have no matching subscription (free /
+# derived products) get an "orphan" row with blank renewal fields, so the
+# CSV remains a complete inventory.
+jq -n -r \
+    --argjson skus "$SKUS" \
+    --argjson subs "$SUBS_LIST" \
+    --argjson map  "$SKU_MAP_JSON" '
+    ($skus | map({(.skuId): .}) | add // {}) as $sku_by_id |
+    ($subs | map(.skuId)) as $sub_skus |
+
+    def header: [
+        "ProductName","SkuPartNumber",
+        "NextRenewalDate","SubscriptionStatus","IsTrial","SubscriptionCreatedDate",
+        "SubscriptionLicenses",
+        "SkuTotalLicenses","SkuConsumedLicenses","SkuAvailableLicenses",
+        "ServicePlans","CommerceSubscriptionId","SkuId","AppliesTo","CapabilityStatus"
+    ];
+
+    def sub_row:
+        . as $sub | ($sku_by_id[.skuId] // {}) as $sku | [
+            ($map[.skuId] // .skuPartNumber // $sku.skuPartNumber),
+            (.skuPartNumber // $sku.skuPartNumber),
+            .nextLifecycleDateTime,
+            .status,
+            .isTrial,
+            .createdDateTime,
+            (.totalLicenses // 0),
+            ($sku.prepaidUnits.enabled // 0),
+            ($sku.consumedUnits // 0),
+            (($sku.prepaidUnits.enabled // 0) - ($sku.consumedUnits // 0)),
+            ([$sku.servicePlans[]?.servicePlanName] | join(";")),
+            (.commerceSubscriptionId // .id // ""),
+            .skuId,
+            ($sku.appliesTo // ""),
+            ($sku.capabilityStatus // "")
+        ];
+
+    def sku_only_row: [
         ($map[.skuId] // .skuPartNumber),
         .skuPartNumber,
-        .skuId,
-        .appliesTo,
-        .capabilityStatus,
+        "", "", "", "",
+        "",
         (.prepaidUnits.enabled // 0),
         (.consumedUnits // 0),
         ((.prepaidUnits.enabled // 0) - (.consumedUnits // 0)),
-        (.prepaidUnits.suspended // 0),
-        (.prepaidUnits.warning // 0),
-        .accountId,
-        .accountName,
-        ([.servicePlans[]?.servicePlanName] | join(";"))
-    ])
+        ([.servicePlans[]?.servicePlanName] | join(";")),
+        "", .skuId, (.appliesTo // ""), (.capabilityStatus // "")
+    ];
+
+    header,
+    ($subs | sort_by(.nextLifecycleDateTime // "9999")[] | sub_row),
+    ($skus | map(select(.skuId as $s | $sub_skus | index($s) | not))
+           | sort_by($map[.skuId] // .skuPartNumber)[]
+           | sku_only_row)
     | @csv
-' <<<"$SKUS" > "$PRODUCTS_CSV"
-echo "Wrote $(jq 'length' <<<"$SKUS") product rows -> $PRODUCTS_CSV"
+' > "$PRODUCTS_CSV"
+
+PRODUCT_ROWS=$(($(wc -l < "$PRODUCTS_CSV") - 1))
+echo "Wrote $PRODUCT_ROWS product rows -> $PRODUCTS_CSV"
 
 # ---------------------------------------------------------------------------
 # Users (+ signInActivity if accessible)
@@ -245,8 +304,6 @@ zip -j -q "$ZIP_PATH" "$USERS_CSV" "$PRODUCTS_CSV" "$STALE_CSV"
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
-TOTAL_SKUS=$(($(wc -l < "$PRODUCTS_CSV") - 1))
-
 echo ""
 echo "========================================="
 echo "  M365 Tenant Assessment Complete"
@@ -254,8 +311,11 @@ echo "========================================="
 echo "Tenant:                    $TENANT_NAME"
 echo "Tenant ID:                 $TENANT_ID"
 echo "Total users:               $TOTAL_USERS"
-echo "Products / SKUs:           $TOTAL_SKUS"
+echo "Product rows:              $PRODUCT_ROWS"
 echo "Stale users (>${STALE_DAYS}d):         $TOTAL_STALE"
+if [[ $SUBS_AVAILABLE -ne 1 ]]; then
+    echo "NOTE: subscription data was unavailable; NextRenewalDate column is blank."
+fi
 if [[ $SIGNIN_AVAILABLE -ne 1 ]]; then
     echo "NOTE: signInActivity was unavailable; stale list uses created-date heuristic only."
 fi
