@@ -122,6 +122,8 @@ get_all_pages() {
 # ---------------------------------------------------------------------------
 # Products / subscribed SKUs + commerce subscriptions (for renewal dates)
 # ---------------------------------------------------------------------------
+NOW_EPOCH=$(date -u +%s)
+
 echo "Collecting subscribed SKUs..."
 SKUS=$(get_all_pages 'https://graph.microsoft.com/v1.0/subscribedSkus')
 
@@ -151,13 +153,21 @@ fi
 jq -n -r \
     --argjson skus "$SKUS" \
     --argjson subs "$SUBS_LIST" \
-    --argjson map  "$SKU_MAP_JSON" '
+    --argjson map  "$SKU_MAP_JSON" \
+    --argjson now  "$NOW_EPOCH" '
     ($skus | map({(.skuId): .}) | add // {}) as $sku_by_id |
     ($subs | map(.skuId)) as $sub_skus |
 
+    # Approximate whole-and-fractional months until the given renewal date.
+    # Average month = 365.25/12 days = 2629800 seconds. Negative => overdue.
+    def months_until($iso):
+        if ($iso == null or $iso == "") then null
+        else ((($iso | fromdateiso8601) - $now) / 2629800 * 10 | round / 10)
+        end;
+
     def header: [
         "ProductName","SkuPartNumber",
-        "NextRenewalDate","SubscriptionStatus","IsTrial","SubscriptionCreatedDate",
+        "NextRenewalDate","MonthsUntilNextRenewal","SubscriptionStatus","IsTrial","SubscriptionCreatedDate",
         "SubscriptionLicenses",
         "SkuTotalLicenses","SkuConsumedLicenses","SkuAvailableLicenses",
         "ServicePlans","CommerceSubscriptionId","SkuId","AppliesTo","CapabilityStatus"
@@ -168,6 +178,7 @@ jq -n -r \
             ($map[.skuId] // .skuPartNumber // $sku.skuPartNumber),
             (.skuPartNumber // $sku.skuPartNumber),
             .nextLifecycleDateTime,
+            months_until(.nextLifecycleDateTime),
             .status,
             .isTrial,
             .createdDateTime,
@@ -185,7 +196,7 @@ jq -n -r \
     def sku_only_row: [
         ($map[.skuId] // .skuPartNumber),
         .skuPartNumber,
-        "", "", "", "",
+        "", "", "", "", "",
         "",
         (.prepaidUnits.enabled // 0),
         (.consumedUnits // 0),
@@ -219,7 +230,6 @@ if ! USERS=$(get_all_pages "https://graph.microsoft.com/v1.0/users?\$select=${PR
     USERS=$(get_all_pages "https://graph.microsoft.com/v1.0/users?\$select=${PROPS_BASE}&\$top=999")
 fi
 
-NOW_EPOCH=$(date -u +%s)
 CUTOFF_EPOCH=$((NOW_EPOCH - STALE_DAYS * 86400))
 
 USERS_FILE=$(mktemp)
