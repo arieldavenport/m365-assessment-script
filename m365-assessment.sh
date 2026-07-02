@@ -15,6 +15,15 @@
 
 set -euo pipefail
 
+TMP_FILES=()
+cleanup_tmp_files() {
+    local f
+    for f in "${TMP_FILES[@]:-}"; do
+        [[ -n "$f" ]] && rm -f "$f"
+    done
+}
+trap cleanup_tmp_files EXIT
+
 STALE_DAYS=90
 OUTPUT_DIR="$HOME"
 SKIP_FRIENDLY=0
@@ -99,6 +108,7 @@ SKU_MAP_JSON='{}'
 if [[ $SKIP_FRIENDLY -ne 1 ]]; then
     echo "Downloading Microsoft SKU friendly-name map..."
     SKU_CSV_TMP=$(mktemp)
+    TMP_FILES+=("$SKU_CSV_TMP")
     SKU_URL='https://download.microsoft.com/download/e/3/e/e3e9faf2-f28b-490a-9ada-c6089a1fc5b0/Product%20names%20and%20service%20plan%20identifiers%20for%20licensing.csv'
     if curl -sf -o "$SKU_CSV_TMP" "$SKU_URL"; then
         SKU_MAP_JSON=$(python3 - "$SKU_CSV_TMP" <<'PY'
@@ -248,6 +258,7 @@ fi
 CUTOFF_EPOCH=$((NOW_EPOCH - STALE_DAYS * 86400))
 
 USERS_FILE=$(mktemp)
+TMP_FILES+=("$USERS_FILE")
 echo "$USERS" > "$USERS_FILE"
 
 # Shared jq prelude: functions used by both the full user CSV and the stale subset.
@@ -415,6 +426,7 @@ GA_COUNT=$(jq '[.[] | select(.roleDefinition.displayName=="Global Administrator"
 # --- MFA / authentication method registration ---
 echo "Collecting authentication method registration details..."
 MFA_FILE=$(mktemp)
+TMP_FILES+=("$MFA_FILE")
 echo '[]' > "$MFA_FILE"
 if MFA_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/reports/authenticationMethods/userRegistrationDetails?$top=999' 2>/dev/null); then
     echo "$MFA_TRY" > "$MFA_FILE"
@@ -489,6 +501,7 @@ if [[ $SIGNIN_AVAILABLE -eq 1 ]]; then
         fi
     else
         echo "WARNING: could not read sign-in logs for legacy-auth detection; skipping." >&2
+        LEGACY_MERGED='[]'
     fi
 
     LEGACY_AGG=$(jq -c '
@@ -525,25 +538,34 @@ if GRAPH_SP_TRY=$(curl -sf -H "$AUTH" "https://graph.microsoft.com/v1.0/serviceP
 fi
 GRAPH_SP_ID=$(jq -r '.id // empty' <<<"$GRAPH_SP_JSON")
 
-SP_FILE=$(mktemp); echo '[]' > "$SP_FILE"
-DEL_FILE=$(mktemp); echo '[]' > "$DEL_FILE"
-APPASSIGN_FILE=$(mktemp); echo '[]' > "$APPASSIGN_FILE"
+SP_FILE=$(mktemp); TMP_FILES+=("$SP_FILE"); echo '[]' > "$SP_FILE"
+DEL_FILE=$(mktemp); TMP_FILES+=("$DEL_FILE"); echo '[]' > "$DEL_FILE"
+APPASSIGN_FILE=$(mktemp); TMP_FILES+=("$APPASSIGN_FILE"); echo '[]' > "$APPASSIGN_FILE"
 
+SP_OK=0; DEL_OK=0; APP_OK=0
 if [[ -n "$GRAPH_SP_ID" ]]; then
     if SP_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,publisherName,verifiedPublisher,appOwnerOrganizationId,signInAudience,passwordCredentials,keyCredentials&$top=999' 2>/dev/null); then
         echo "$SP_TRY" > "$SP_FILE"
+        SP_OK=1
         if DEL_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$top=999' 2>/dev/null); then
             echo "$DEL_TRY" > "$DEL_FILE"
+            DEL_OK=1
+        else
+            echo "WARNING: could not read oauth2PermissionGrants; delegated permission grants will be omitted from the OAuth consent review." >&2
         fi
         if APP_TRY=$(get_all_pages "https://graph.microsoft.com/v1.0/servicePrincipals/${GRAPH_SP_ID}/appRoleAssignedTo?\$top=999" 2>/dev/null); then
             echo "$APP_TRY" > "$APPASSIGN_FILE"
+            APP_OK=1
+        else
+            echo "WARNING: could not read Microsoft Graph app-role assignments; application permission grants will be omitted from the OAuth consent review." >&2
         fi
-        OAUTH_AVAILABLE=1
     fi
 fi
 
-if [[ $OAUTH_AVAILABLE -ne 1 ]]; then
-    echo "WARNING: could not read service principals / OAuth grants (requires Directory.Read.All); skipping app consent review." >&2
+if [[ $SP_OK -eq 1 && $DEL_OK -eq 1 && $APP_OK -eq 1 ]]; then
+    OAUTH_AVAILABLE=1
+else
+    echo "WARNING: OAuth app consent review is incomplete (requires Directory.Read.All for service principals, oauth2PermissionGrants, and app role assignments)." >&2
 fi
 
 GRAPH_APP_ROLES_JSON=$(jq -c '.appRoles // []' <<<"$GRAPH_SP_JSON")
@@ -671,12 +693,12 @@ SECDEFAULTS_BOOL="null"
 [[ "$SECDEFAULTS_ENABLED" == "true" ]] && SECDEFAULTS_BOOL="true"
 [[ "$SECDEFAULTS_ENABLED" == "false" ]] && SECDEFAULTS_BOOL="false"
 
-jq -r --argjson secdefaults "$SECDEFAULTS_BOOL" --argjson ca "$CA_POLICIES" --argjson roles "$ROLE_ASSIGNMENTS" \
+jq -r --argjson secdefaults "$SECDEFAULTS_BOOL" --argjson ca "$CA_POLICIES" --argjson caAvailable "$([[ $CA_AVAILABLE -eq 1 ]] && echo true || echo false)" --argjson roles "$ROLE_ASSIGNMENTS" \
       --argjson noMfaAdmins "$NO_MFA_ADMINS" --argjson staleAdmins "$STALE_ADMINS" --argjson legacyAgg "$LEGACY_AGG" \
       --argjson oauthRisky "$OAUTH_RISKY" --argjson expiredCredApps "$EXPIRED_CRED_APPS" --argjson riskyUsers "$RISKY_USERS" '
 def sev($s;$cat;$find;$obj;$rec): {severity:$s, category:$cat, finding:$find, affected:$obj, recommendation:$rec};
 
-( if ($secdefaults == false) and (($ca // []) | map(select(.state=="enabled")) | length) == 0 then
+( if ($secdefaults == false) and $caAvailable and (($ca // []) | map(select(.state=="enabled")) | length) == 0 then
     [sev("High";"Identity Baseline";"No baseline identity protection: security defaults are disabled and no Conditional Access policy is enabled";"Tenant";"Enable security defaults or create enforced Conditional Access policies requiring MFA")]
   else [] end ) as $baseline_findings |
 
@@ -767,7 +789,11 @@ if [[ $SKIP_SECURITY -ne 1 ]]; then
     echo ""
     echo "-- Security review --"
     echo "Security defaults enabled: ${SECDEFAULTS_ENABLED:-unknown}"
-    echo "Global Administrators:     $GA_COUNT"
+    if [[ $ROLES_AVAILABLE -eq 1 ]]; then
+        echo "Global Administrators:     $GA_COUNT"
+    else
+        echo "Global Administrators:     unknown (role assignments unavailable)"
+    fi
     if [[ -n "$SECURESCORE_CURRENT" ]]; then
         echo "Secure Score:              ${SECURESCORE_CURRENT} / ${SECURESCORE_MAX}"
     fi
